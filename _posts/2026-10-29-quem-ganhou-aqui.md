@@ -18,7 +18,7 @@ polling place and shows president (both rounds), governor (both rounds), senator
 and state deputy for that place, its neighbourhood, its electoral zone, the city, the state
 and the country.
 
-<img src="/assets/quemganhou/mobile-results.jpg" alt="Phone view of the results for Avenida Paulista: search and scope tabs on top, a one-sentence summary of the presidential race, a table comparing the polling place with the state, and a bottom action bar" width="375">
+<img src="/assets/quemganhou/mobile-results.jpg" alt="Phone view of the results for Avenida Paulista: a red-to-blue map of São Paulo with a search box on top and the answer, Lula venceu aqui, in a bottom sheet" width="375">
 
 This post covers two things: the data engineering, and how I used an AI coding agent
 (Claude Code) to do most of the build, including where the agent was *blocked on purpose*.
@@ -92,14 +92,14 @@ results page.
 - **Coordinates → polling place:** load the index of municipality centroids (~115 KB gzip),
   fetch the 5 nearest municipality shards, run a haversine over their polling places, and
   pick the nearest. Loading several shards handles addresses near a city border.
-- **Map:** Leaflet, with one dot per polling place coloured by the winner. Before you
-  search, the landing page shows one dot per municipality (5,571) coloured by the runoff
-  winner, from two extra fields in the index.
+- **Map:** Leaflet, with a canvas surface computed in the browser from the polling-place
+  results. Before you search, the same surface runs over all 5,571 municipalities, from two
+  extra fields in the index.
 - **Shareable state:** coordinates, place and scope live in the URL hash.
 
-![Desktop view of the Quem ganhou aqui? landing page: the national runoff split on the left and a dot map of Brazil's municipalities coloured by winner on the right](/assets/quemganhou/desktop-landing.jpg)
+![Desktop landing page: a red-to-blue surface over Brazil, with a search box and the national runoff result in a small card](/assets/quemganhou/desktop-landing.jpg)
 
-![Desktop split view: results panel on the left, full-height map of polling places coloured by winner on the right](/assets/quemganhou/desktop-results.jpg)
+![Desktop results for Avenida Paulista: a card with the answer and one row per race, over a full-screen red-to-blue map of São Paulo](/assets/quemganhou/desktop-results.jpg)
 
 One honesty point in the UI: the site shows the **nearest** polling place, not *your*
 polling place. The open data doesn't link addresses to voter registrations, and the page
@@ -178,15 +178,8 @@ The redesign borrows from newspaper results desks instead of SaaS templates:
 - **Data on the landing page, not copy.** Before you search you see the national runoff
   split and the dot map of all 5,571 municipalities.
 
-Desktop and mobile now get different layouts, not one layout squeezed:
-
-- **Desktop** is a split app. A 480 px results panel scrolls on its own, the map fills the
-  rest of the screen, the scope tabs (place / neighbourhood / zone / city / state /
-  country) stick at the top of the panel, and `/` focuses the search box.
-- **Mobile** is one column. The search box and scope tabs stick to the top, and a bottom
-  bar (Map / Share / New search) sits in the thumb zone. The map opens full screen on
-  demand. The inline landing map has dragging disabled, so a swipe scrolls the page instead
-  of getting trapped panning the map. Share uses the native share sheet.
+Desktop and mobile got different layouts: a split app with a scrolling results panel beside a
+full-height map, and a single column with sticky tabs and a bottom action bar.
 
 Testing at 375 px caught bugs a desktop review wouldn't:
 
@@ -195,10 +188,41 @@ Testing at 375 px caught bugs a desktop review wouldn't:
 - PL's navy dots disappeared on the dark-mode map, so the colour was brightened.
 - A shared link with a scope but no polling place ignored the scope.
 
-All of it was checked in a browser at desktop width (light and dark) and at 375 px, with no
-horizontal overflow and no console errors.
+## Third pass: the map is the page
 
-The same address, before and after:
+It looked professional now, but my next note was that there was too much on the screen, and
+that options should be there for the people who want them. I suggested a red-to-blue overlay
+on the map to show your area.
+
+The agent looked for references first. Estadão's 2018 "How did your neighborhood vote?" map
+turned polling places into areas with Voronoi cells, and the New York Times precinct maps
+reduce the interaction to searching and letting the map answer. It went one step past
+Voronoi, because hard cells aren't a gradient:
+
+- **A smoothed surface.** Each polling place adds a Gaussian kernel, weighted by votes, to a
+  coarse buffer. Each cell then gets the margin between the two leading candidates, which is
+  upscaled onto a canvas and clipped to Brazil's outline. The kernel width comes from the
+  distance to the third-nearest neighbour, so dense cities stay sharp and the interior stays
+  continuous. It redraws in under 100 ms.
+- **Neutral means close.** The scale runs from one candidate through a neutral midpoint to
+  the other, and saturates at a 40-point margin. It's an estimate, not a real boundary, and
+  the site says so.
+- **One answer.** "Lula venceu aqui" and a split bar. Other races are one-line rows that
+  expand into the table, the area is a single dropdown, and tapping the map picks the nearest
+  polling place.
+- **One component, two behaviours.** The same element is a floating card on desktop and a
+  two-position bottom sheet on phones, which you drag or tap. Search floats at the top.
+
+The agent checked this with Playwright in Docker, with real phone emulation: expanding rows,
+the area dropdown, map taps, the bottom sheet and horizontal overflow, first locally and then
+against the live site.
+
+It also hit a reminder of why the SSH allowlist is on my list to replace: my home IP changed,
+the deploy timed out, and the live site stayed on the old version until I approved updating
+the rule. A `tail` in the agent's command had hidden the failed deploy from the next step, so
+it committed before noticing. Nothing broke, but the code and the live site briefly disagreed.
+
+The same address, first version and now:
 
 <div class="compare">
   <figure>
@@ -206,8 +230,8 @@ The same address, before and after:
     <img src="/assets/quemganhou/before.jpg" alt="First version: stacked rounded cards with a square party badge">
   </figure>
   <figure>
-    <figcaption>Redesign</figcaption>
-    <img src="/assets/quemganhou/after.jpg" alt="Redesign: a plain-language summary above a table of candidates">
+    <figcaption>Now</figcaption>
+    <img src="/assets/quemganhou/after.jpg" alt="Current version: a red-to-blue map of São Paulo with the answer in a compact bottom sheet">
   </figure>
 </div>
 
