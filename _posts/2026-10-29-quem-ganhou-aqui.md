@@ -200,13 +200,16 @@ horizontal overflow and no console errors.
 
 The same address, before and after:
 
-<table>
-  <tr><th>First version</th><th>Redesign</th></tr>
-  <tr>
-    <td><img src="/assets/quemganhou/before.jpg" alt="First version: stacked rounded cards with a square party badge"></td>
-    <td><img src="/assets/quemganhou/after.jpg" alt="Redesign: a plain-language summary above a table of candidates"></td>
-  </tr>
-</table>
+<div class="compare">
+  <figure>
+    <figcaption>First version</figcaption>
+    <img src="/assets/quemganhou/before.jpg" alt="First version: stacked rounded cards with a square party badge">
+  </figure>
+  <figure>
+    <figcaption>Redesign</figcaption>
+    <img src="/assets/quemganhou/after.jpg" alt="Redesign: a plain-language summary above a table of candidates">
+  </figure>
+</div>
 
 ## Timeline of the first version (from log timestamps)
 

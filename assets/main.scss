@@ -1,0 +1,36 @@
+---
+---
+
+@import "minima";
+
+// Wide tables and code scroll in place so the page itself fits a phone.
+.post-content table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.post-content pre {
+  overflow-x: auto;
+}
+
+.compare {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 15px;
+}
+
+.compare figure {
+  margin: 0;
+}
+
+.compare figcaption {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.compare img {
+  width: 100%;
+  border: 1px solid #e8e8e8;
+}
