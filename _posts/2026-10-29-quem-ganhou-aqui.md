@@ -1,261 +1,183 @@
 ---
 layout: post
-title: "Who won on my street? Every ballot box in Brazil, one DuckDB file, and an agent that knew when to stop"
+title: "Who won on my street? 92,965 polling places on a GPU, with no backend"
 date: 2026-10-29
-tags: [duckdb, data-engineering, ai-assisted-development, elections, static-sites]
-description: "Building quemganhou.pealan.dev: section-level results from Brazil's 2026 election, rolled up to every polling place, served as static JSON from a t4g.nano, with an AI agent doing the build and a human holding the keys."
+tags: [duckdb, webgl, data-engineering, ai-assisted-development, elections]
+description: "How I built Quem ganhou aqui?, a static site that maps Brazil's 2026 election down to the polling place: a DuckDB pipeline over section-level data, a WebGL surface inside MapLibre, a purpose-built basemap, and a development process directed through Claude Code and checked by measurement."
 ---
 
-Brazil's electoral court (TSE) publishes the vote count of **every single ballot box**, for
-every race. The 2026 general election finished its runoff on 25 October; by the 26th the
-files were on the TSE CDN.
+**[Quem ganhou aqui?](https://quemganhou.pealan.dev)** ("Who won here?") opens at your location,
+if you allow it, and answers one question: who won the 2026 Brazilian general election around you.
+It covers president, governor, senator, and federal and state deputies, for your neighbourhood,
+polling place, electoral zone, city, state and country, over a continuous red-to-blue surface of
+the whole country.
 
-Results coverage usually stops at the city. I wanted the question people actually ask when
-they argue at the bakery: *who won here, on my street?* So I built
-**[quemganhou.pealan.dev](https://quemganhou.pealan.dev)** ("who won here?"): type an
-address or a CEP (Brazilian postcode), or share your location, and it finds the nearest
-polling place and shows president (both rounds), governor (both rounds), senator, federal
-and state deputy for that place, its neighbourhood, its electoral zone, the city, the state
-and the country.
+![The national view in dark mode: a red-to-blue surface over Brazil with state lines and the runoff result, Lula 51.8% and Flávio Bolsonaro 48.2%](/assets/quemganhou/national-surface-dark.jpg)
 
-<img src="/assets/quemganhou/mobile-results.jpg" alt="Phone view of the results for Avenida Paulista: a red-to-blue map of São Paulo with a search box on top and the answer, Lula venceu aqui, in a bottom sheet" width="375">
+The hard part is the combination. The source is about 3 GB of zipped electoral data at ballot-box
+level. The site has no backend, no API keys and no cookies, at near-zero marginal hosting cost. And
+the map has to stay smooth while drawing every polling place in a country of 5,571 municipalities.
 
-This post covers two things: the data engineering, and how I used an AI coding agent
-(Claude Code) to do most of the build, including where the agent was *blocked on purpose*.
+I built it with Claude Code. This post covers the engineering, then how I directed the agent,
+including what it got wrong.
 
-## The data
+## Data: ballot boxes to six levels of rollup
 
-Everything comes from the [TSE open-data portal](https://dadosabertos.tse.jus.br/):
+The electoral court (TSE) publishes the count of every voting section for every race. The files
+are Latin-1, `;`-separated CSVs. Coordinates use decimal commas and `-1` for "unknown". Vote number
+95 is blank, 96 and 97 are null, and two-digit numbers in deputy races are party votes that count
+as valid but must not be ranked as candidates.
 
-| File | What's in it | Size |
-|---|---|---|
-| `votacao_secao_2026_<UF>.zip` ×27 | votes per **section** (ballot box) for governor, senator, deputies | SP alone: 808 MB zipped |
-| `votacao_secao_2026_BR.zip` | president, both rounds, every section | 242 MB |
-| `eleitorado_local_votacao_2026.zip` | every polling place: neighbourhood, postcode, **lat/lon**, voters per section | 167 MB |
-| `consulta_cand_2026.zip` | candidates: ballot name, party, final outcome | 3 MB |
+The site is read-only, so everything is precomputed. A DuckDB pipeline loads each file and
+aggregates to the polling place immediately, so section rows are never stored. Window functions
+then rank the top candidates per race at six levels: polling place, neighbourhood, zone, city,
+state and country. The load takes about 18 minutes under a 2 GB memory limit, spilling to disk, and
+stays cached in the DuckDB file so later stages can rerun without it.
 
-About **3 GB of zips**. The CSVs are `;`-separated and Latin-1 encoded; coordinates use a
-decimal comma, and `-1` means "unknown". Vote number 95 is a blank ballot, 96 is a null
-vote, and two-digit numbers in the deputy races are votes for a party rather than a person.
+The output is 5,571 municipality shards. The check I trust most: the national runoff, rebuilt from
+raw section data, gives **Lula 51.78%, Flávio Bolsonaro 48.22%**. Of 94,539 polling places, 92,965
+have usable coordinates, and those are what the map draws.
 
-## The pipeline: one DuckDB file, three stages
+One trap: the candidate status field holds only the final outcome, so a runoff loser reads "not
+elected" on the first-round results too. "Went to the runoff" has to be inferred from the
+second-round data.
 
-I didn't want a database server for a read-only site, so the whole thing is precomputed.
-`pipeline/build.py` is about 250 lines of Python driving DuckDB:
+## Rendering: a surface, not dots
 
-1. **Load.** Stream each zip member to disk, `read_csv(..., encoding='latin-1')`, and
-   immediately `GROUP BY` polling place: `(state, municipality, zone, place, race, round,
-   candidate)`. Section-level rows never get stored; only the rollup does. Then join in
-   polling-place metadata (neighbourhood, coordinates) and candidate metadata.
-2. **Rank.** For each geographic level (place → neighbourhood → zone → city → state →
-   Brazil), compute totals (blank, null, valid votes) and the top-N candidates per race with
-   a window function:
+Election maps often use Voronoi cells around polling places. I wanted a gradient instead: each
+polling place contributes a Gaussian kernel, and the map shows the vote-weighted margin between
+the two leading candidates.
 
-   ```sql
-   select * from (
-     select *, row_number() over (
-              partition by uf, mun, zona, loc, t, cargo order by votos desc) rk
-     from (select uf, mun, zona, loc, t, cargo, sq, num, sum(votos) votos
-           from vv where sq > 0 group by all))
-   where rk <= :top_n   -- 5–6 per race for a polling place, 8–15 for larger areas
-   ```
+The first version computed this on a canvas and redrew on `moveend`. It was slow, kept the old
+picture during a pinch, and had holes. So it moved to WebGL2, as a custom layer inside MapLibre,
+in two passes:
 
-3. **Export.** One JSON shard per municipality, plus one per state and an index of
-   municipality centroids. Candidate metadata is deduplicated into a per-file array, and
-   results reference it by index.
+1. **Splat.** Instanced quads with additive blending write into a half-float texture: Σ g·w in red,
+   Σ g·w·margin in green, Σ g in blue.
+2. **Colour.** A full-screen pass divides the channels, giving a true weighted average per pixel:
 
-On a WSL box with 3 GB of RAM (`memory_limit='2GB'`, spilling to disk):
+```glsl
+vec4 f = texture(tex, uv);
+float m = f.y / f.x;                        // vote-weighted margin here
+float t = pow(min(1., abs(m) / .4), .75);   // saturates at a 40-point margin
+vec3 c = mix(N, m >= 0. ? A : B, t);        // neutral means close
+```
 
-| Stage | Time |
-|---|---|
-| Download 28 zips (6 in parallel) | ~2 min |
-| Load + roll up (São Paulo alone: 4.5 min) | ~18 min |
-| Rank, 6 levels | ~5 min |
-| Export 5,571 shards | ~2 min |
+Kernel width comes from the distance to the third-nearest neighbour, computed in the pipeline with
+a grid index, clamped, and stored as a log-scaled byte. Dense cities stay sharp and the interior
+stays continuous.
 
-Output: **5,571 municipality files, 112 MB**. The largest, São Paulo city, has 2,058
-polling places and weighs 1.8 MB raw, **~760 KB over the wire** with nginx gzip. A small
-town is a few KB.
-
-Sanity check: the national runoff comes out at **Lula 51.78% vs Flávio Bolsonaro 48.22%**
-of valid votes. That number is reproduced from the raw section data, not copied from a
-results page.
-
-## The site: static, no keys, no backend
-
-- **Hosting:** a static folder on the AWS `t4g.nano` that already serves my other side
-  projects. Marginal cost of one more site: roughly zero.
-- **Address → coordinates, in the browser:** [Photon](https://photon.komoot.io) for
-  type-ahead, Nominatim as a fallback, and [BrasilAPI](https://brasilapi.com.br) for
-  postcodes. No API keys and no cookies, and the typed address never reaches my server,
-  which only serves static files. Those third-party services do receive it.
-- **Coordinates → polling place:** load the index of municipality centroids (~115 KB gzip),
-  fetch the 5 nearest municipality shards, run a haversine over their polling places, and
-  pick the nearest. Loading several shards handles addresses near a city border.
-- **Map:** Leaflet, with a canvas surface computed in the browser from the polling-place
-  results. Before you search, the same surface runs over all 5,571 municipalities, from two
-  extra fields in the index.
-- **Shareable state:** coordinates, place and scope live in the URL hash.
-
-![Desktop landing page: a red-to-blue surface over Brazil, with a search box and the national runoff result in a small card](/assets/quemganhou/desktop-landing.jpg)
-
-![Desktop results for Avenida Paulista: a card with the answer and one row per race, over a full-screen red-to-blue map of São Paulo](/assets/quemganhou/desktop-results.jpg)
-
-One honesty point in the UI: the site shows the **nearest** polling place, not *your*
-polling place. The open data doesn't link addresses to voter registrations, and the page
-says so.
-
-## The agentic part
-
-I gave the agent one paragraph: the site, the races, "use the infrastructure already in
-place in WSL, check the latest project to understand the agentic structure and generalize
-it, depend on me as little as possible."
-
-What it did, in order:
-
-1. **Read before writing.** It found my `~/deploy-kit` (a playbook plus scripts for my shared
-   box), the router-style `CLAUDE.md` of my most recent project (a docs table, working
-   rules and status), its append-only `WORK_DIARY.md`, and its `/handoff` skill that moves
-   session knowledge into files before the session ends.
-2. **Probed the data source** with `curl -I` against the guessed CDN paths before writing
-   any pipeline, which confirmed that both rounds were published and sized each file.
-3. **Built the pipeline, the site, and the project scaffolding** (router `CLAUDE.md`, a
-   `data-refresh` operator agent, a `docs/data.md` with the JSON contract between pipeline
-   and frontend).
-4. **Generalized the infra** instead of copy-pasting it:
-   - `new-static-site.sh <label>`: DNS, a per-site deploy key that can only `rsync` into
-     its own docroot, the nginx vhost (now with gzip) and TLS, in one idempotent command.
-   - `project-template/`: the router + diary + handoff skeleton for the next project.
-   - A guard in the provisioning script. Re-running it used to overwrite the nginx vhost,
-     which silently drops the HTTPS block that certbot adds. Now it refuses unless forced.
-
-### Where it stopped, on purpose
-
-The agent runs with a permission classifier. It was **blocked twice**:
-
-- **Changing shared infra.** Creating the DNS record and editing the SSH allowlist on the
-  security group touch a box that hosts other sites. The agent finished everything else,
-  then asked me for a single command. I approved it, and it ran.
-- **Pushing to GitHub.** Classified as a public data-sharing upload. It stopped again until
-  I said yes.
-
-That's the division of labour I want: the agent does the build, I hold the keys to anything
-shared or public.
-
-### Bugs it hit (and fixed)
-
-- **CARTO basemaps now require an API key.** The first map rendered "API KEY REQUIRED"
-  across every tile. It switched to standard OpenStreetMap tiles with a CSS
-  `grayscale()`/`invert()` filter so the party colours carry the meaning.
-- **The candidate status field only holds the final outcome.** A runoff loser reads "not
-  elected" on the first-round card too, so the "went to the runoff" tag can't come from
-  that field. It's inferred from the presence of the candidate in the state-wide
-  second-round result instead.
-- **DuckDB: "Cannot mix aggregates with non-aggregated columns."** A `row_number() over
-  (order by sum(votos))` inside a `GROUP BY ALL` query. The fix was to aggregate in a
-  subquery and window over the result. The loaded tables were cached in the DuckDB file,
-  so the rerun skipped the 18-minute load.
-- **SSH "Host key verification failed"** on the first real run of the new provisioning
-  script. `known_hosts` knew the box by hostname, not by IP. It's a one-line fix, and it
-  only showed up because the script finally ran against production.
-
-## Second pass: making it not look AI-generated
-
-The first version worked, but it looked like what it was: a generated landing page. It had
-a centered serif headline with one highlighted word, pill-shaped chips, a stack of
-identical shadowed cards, square party badges, and Inter plus Fraunces. My feedback was one
-line: make it professional, give desktop and mobile their own UX, and don't be cliché.
-
-The redesign borrows from newspaper results desks instead of SaaS templates:
-
-- **Tables, not cards.** Each race is one plain-language sentence (in Portuguese on the
-  site; roughly "Lula won here with 62%, 16 points above his state result" for Av. Paulista)
-  followed by a table: candidate, share *here*, share
-  *in the state*, and the difference in percentage points. The comparison was always the
-  interesting part; now it's the layout.
-- **Ink on paper.** Libre Franklin with tabular figures, hairline rules instead of
-  shadows, no border radius, and colour only where it encodes a party.
-- **Data on the landing page, not copy.** Before you search you see the national runoff
-  split and the dot map of all 5,571 municipalities.
-
-Desktop and mobile got different layouts: a split app with a scrolling results panel beside a
-full-height map, and a single column with sticky tabs and a bottom action bar.
-
-Testing at 375 px caught bugs a desktop review wouldn't:
-
-- The results table overflowed the screen at 375 px. It now uses `table-layout: fixed`.
-- The "your address" pin was red, the same colour as PT's dots. It's now an ink ring.
-- PL's navy dots disappeared on the dark-mode map, so the colour was brightened.
-- A shared link with a scope but no polling place ignored the scope.
-
-## Third pass: the map is the page
-
-It looked professional now, but my next note was that there was too much on the screen, and
-that options should be there for the people who want them. I suggested a red-to-blue overlay
-on the map to show your area.
-
-The agent looked for references first. Estadão's 2018 "How did your neighborhood vote?" map
-turned polling places into areas with Voronoi cells, and the New York Times precinct maps
-reduce the interaction to searching and letting the map answer. It went one step past
-Voronoi, because hard cells aren't a gradient:
-
-- **A smoothed surface.** Each polling place adds a Gaussian kernel, weighted by votes, to a
-  coarse buffer. Each cell then gets the margin between the two leading candidates, which is
-  upscaled onto a canvas and clipped to Brazil's outline. The kernel width comes from the
-  distance to the third-nearest neighbour, so dense cities stay sharp and the interior stays
-  continuous. It redraws in under 100 ms.
-- **Neutral means close.** The scale runs from one candidate through a neutral midpoint to
-  the other, and saturates at a 40-point margin. It's an estimate, not a real boundary, and
-  the site says so.
-- **One answer.** "Lula venceu aqui" and a split bar. Other races are one-line rows that
-  expand into the table, the area is a single dropdown, and tapping the map picks the nearest
-  polling place.
-- **One component, two behaviours.** The same element is a floating card on desktop and a
-  two-position bottom sheet on phones, which you drag or tap. Search floats at the top.
-
-The agent checked this with Playwright in Docker, with real phone emulation: expanding rows,
-the area dropdown, map taps, the bottom sheet and horizontal overflow, first locally and then
-against the live site.
-
-It also hit a reminder of why the SSH allowlist is on my list to replace: my home IP changed,
-the deploy timed out, and the live site stayed on the old version until I approved updating
-the rule. A `tail` in the agent's command had hidden the failed deploy from the next step, so
-it committed before noticing. Nothing broke, but the code and the live site briefly disagreed.
-
-The same address, first version and now:
+**Performance.** Running inside the map's frame fixed the lag, but forced frames on an integrated
+Intel GPU at 1440×900 had a median of about 15 ms with spikes to 52 ms at national zoom. That left
+no headroom, because all 93k kernels were splatted every frame. So the splat now renders into a
+cached texture 1.6× the viewport, and each frame only resamples it for the current camera. It
+stays anchored during a pinch and redraws when the camera drifts too far or comes to rest. Level
+of detail does the rest: below zoom 6.2 municipalities stand in for polling places, and below zoom
+9 the splat runs at half resolution. A test reads a splat counter to prove that panning doesn't
+re-splat.
 
 <div class="compare">
   <figure>
-    <figcaption>First version</figcaption>
-    <img src="/assets/quemganhou/before.jpg" alt="First version: stacked rounded cards with a square party badge">
+    <figcaption>Zoom 5: regions</figcaption>
+    <img src="/assets/quemganhou/zoom-regional.jpg" alt="South-east Brazil at zoom 5: a smooth surface with state lines and only state and capital labels">
   </figure>
   <figure>
-    <figcaption>Now</figcaption>
-    <img src="/assets/quemganhou/after.jpg" alt="Current version: a red-to-blue map of São Paulo with the answer in a compact bottom sheet">
+    <figcaption>Zoom 8: towns</figcaption>
+    <img src="/assets/quemganhou/zoom-towns.jpg" alt="The Campinas region at zoom 8: the surface resolves town by town, with roads and city names">
   </figure>
 </div>
 
-## Timeline of the first version (from log timestamps)
+**The render-pass gotcha.** The surface sits under water and roads, so the coastline comes from the
+map. But it painted straight over the water. MapLibre draws fully opaque fills in an earlier pass
+than custom layers, whatever their order in the layer list. The fix is one number: water and the
+masks use opacity `.999`, which moves them into the later pass.
 
-| | Local time |
-|---|---|
-| Request | ~01:15 |
-| First TSE download | 01:20 |
-| Full build done (5,571 shards) | 01:48 |
-| Site tested locally and committed | 01:51 |
-| *(a few minutes waiting for my approval to touch shared infra)* | |
-| Live over HTTPS, smoke-tested | ~01:58 |
-| Code pushed to GitHub, after a second approval | 02:35 |
-| Redesign live | ~02:44 |
+**No holes.** Every municipality also carries a wide kernel at a weight of 0.002. Near a polling
+place it is negligible. Where none reaches, deep in the Amazon for example, it is the only
+contribution, and the weighted average still gives the right colour. The earlier version dropped
+municipalities when zoomed in, which caused the gaps.
 
-About **35 minutes of agent work** to a locally verified site, and about 45 minutes from
-request to live. *(The request time is an estimate; the others come from logs and commits.)*
-The redesign followed in a second pass, while a parallel agent session drafted this post.
+## A basemap built for one job
+
+Off-the-shelf styles fought the data: rivers and roads looked stronger than state lines, and the
+national view pulled in large tiles full of detail nobody needed. So I replaced them with one layer
+list and two palettes. Below zoom 7, everything drawn comes from a GeoJSON file generated from IBGE
+(national statistics office) boundaries: states, a sea mask, neighbouring countries and our own
+Portuguese labels.
+
+A layer hidden at the current zoom makes MapLibre skip its source, so the national view requests
+**zero tiles**. I confirmed that by counting requests on the live site, and it is why zooming out
+is instant.
+
+## Delivery
+
+- **Binary columns.** Map data is delta-coded 16-bit coordinates plus byte-sized margins and vote
+  weights, inflated in the browser with `DecompressionStream`. First paint needs 57 KB for
+  municipalities. Every polling place adds about 520 KB.
+- **Payload split.** Per-place votes moved out of the default shard, since the neighbourhood view
+  never reads them. São Paulo dropped from 759 KB to 381 KB over the wire.
+- **Service worker.** Code and data come from cache and refresh in the background, so repeat visits
+  skip the round trips. Pages stay network-only.
+
+## Privacy and links
+
+My first URL design was wrong. The hash held exact coordinates and free text, so sharing a result
+found through "use my location" published where you were standing.
+
+Links now carry an area, never a position. About 57,000 statically generated pages, such as
+[`/sp/sao-paulo/pinheiros/`](https://quemganhou.pealan.dev/sp/sao-paulo/pinheiros/), have their own
+title and Open Graph tags, because crawlers never see a hash. Fragments for a polling place or zone
+must match strict patterns, and the site ships a default-deny Content Security Policy. Old links
+still open: coordinates are strictly parsed, the text is ignored, and the URL is rewritten on
+arrival. A regression test feeds in a legacy link carrying an `onerror` payload.
+
+<img src="/assets/quemganhou/phone-neighbourhood.jpg" alt="Phone view of Pinheiros, São Paulo: the map with polling-place dots, a compact legend, and a bottom sheet reading Lula venceu no bairro, 62.2% to 37.8%" width="375">
+
+The interface is honest about its limits. The open data doesn't link addresses to voter
+registrations, so the site says this is the nearest polling place, not necessarily yours. The
+surface is labelled as a smoothed estimate, not real boundaries.
+
+## How I directed the agent
+
+The first brief was one paragraph: the site, the races, use my existing setup, depend on me as
+little as possible. What followed is why I trust this way of working:
+
+- **It read before writing**, starting from my latest project's structure. HEAD requests against
+  the guessed TSE paths confirmed that both rounds were published, and sized each file, before any
+  pipeline existed.
+- **It generalised instead of copying.** Site provisioning became one idempotent command, and the
+  project structure became a template.
+- **Context lives in files.** A short router-style `CLAUDE.md`, a data contract, and a dated work
+  diary recording decisions, dead ends and what each change reverses. A new session can resume cold.
+
+The first version worked and looked generated. The quality came from review rounds, and those were
+mine. "Too much information on the screen" turned a split-panel app into a full-screen map.
+"Slow, keeps the old shape, missing in some areas" drove the GPU layer. Rivers stronger than state
+lines produced the custom basemap. The architecture went from Leaflet canvas to GPU layer to owned
+basemap because I used the thing and said what was wrong. The agent found causes and built fixes
+far faster than I could have.
+
+Real bugs, found by measuring and looking:
+
+- **Water.** The render-pass issue above, caught by looking at the rendered map.
+- **English in dark mode.** The Portuguese label override matched one style's layer ids only, so
+  the dark style showed English names. The basemap now has one layer list for both themes.
+- **The missing legend.** `syncSurface` returned early when the surface hadn't changed, so a result
+  arriving after the landing surface never revealed the legend. Share links hid the bug, because
+  there the document arrives first. A test now covers a phone that locates itself after load.
+
+I don't take an agent's "done" as evidence, so verification is automated. Playwright drives desktop
+and real phone emulation against the deployed site, reads pixels back from the GL canvas to measure
+how much land is painted, and checks coverage in five locations that used to be blank. The same
+rule applies to the agent's notes: one diary entry said São Paulo had dropped to 309 KB, measuring
+the real response gave 381 KB, and the diary was corrected.
+
+![Desktop view at Avenida Paulista: a results card for the Bela Vista neighbourhood beside a street-level surface, red through the centre and blue towards Jardim Europa](/assets/quemganhou/street-level-results.jpg)
 
 ## What I'd do next
 
 - Add 2022 to show the swing per polling place: same pipeline, different year.
-- Trim the shards (shorter keys, drop the postcode field) to cut the São Paulo payload.
-- Move admin SSH to AWS SSM Session Manager so no allowlist needs updating at all.
+- Generate a preview image per area. Link cards have their own text but share one national image.
+- Measure real frame timing on low-end phones. My numbers come from forced frames on one integrated GPU.
 
-The site is live at [quemganhou.pealan.dev](https://quemganhou.pealan.dev). Try your own street.
+Try your own street: **[quemganhou.pealan.dev](https://quemganhou.pealan.dev)**.
